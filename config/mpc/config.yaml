@@ -31,7 +31,7 @@ mpc:
   #   n_update_iter_init: 100    # optimization steps for the first update ~ planning
   #   n_update_iter: 100         # optimization steps for the subsequent updates
     beta_filter: 0.7
-    lr: 0.05
+    lr: 0.001
 
   # MPC param
   n_mpc: 20
@@ -40,7 +40,16 @@ mpc:
   n_update_iter: 200
   gd_loop: 1
   mpc_type: 'GD'
-  time_lim: 2000 # unit: ms per step
+  time_lim: 200 # unit: ms per step
+  
+  # Visualization options
+  visualization:
+    save_images: True         # Save image after each action
+    save_video: True          # Save video of all actions
+    video_fps: 10              # Frames per second for the video
+    video_speedup: 4.0        # Speedup factor for video (1.0 = normal speed)
+    plot_rewards: True        # Plot reward graph over action steps
+    output_dir: 'outputs'     # Output directory for saved files
   task:
     type: 'target_shape' # 'target_control'; 'target_shape'
     # target_control: push objects to [goal_row, goal_col] with radius goal_r
@@ -49,7 +58,7 @@ mpc:
     goal_row: 360
     goal_col: 360
     goal_r: 75
-    target_char: 'I'
+    target_char: 'A'
   res_sel:
     active: True
     model_folder: '2023-01-30-16-17-30-292500' # data_gp_param_0130; MSELoss; -1

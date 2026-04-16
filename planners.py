@@ -11,6 +11,7 @@ from scipy.special import softmax
 
 # netcompdy
 from model.gnn_dyn import PropNetDiffDenModel
+from model.eulerian_wrapper import EulerianModelWrapper
 from env.flex_rewards import highest_reward, config_reward, distractor_reward, distractor_reward_diff, config_reward_ptcl
 
 from utils import fps_np, pcd2pix
@@ -351,6 +352,11 @@ class PlannerGD(Planner):
             # add condition
             if type(model_dy) == PropNetDiffDenModel:
                 states_pred_tensor[:, i, :, :] = model_dy.predict_one_step(a_cur_tensor, s_cur_tensor, s_delta_tensor, s_param_tensor)
+            elif isinstance(model_dy, EulerianModelWrapper):
+                # Pass particles + raw action [sx, sy, ex, ey]; the wrapper
+                # handles occupancy conversion and action-to-cam-3d internally.
+                states_pred_tensor[:, i, :, :] = model_dy.predict_one_step(
+                    s_cur_tensor, act_seqs[:, i, :])
             else:
                 raise NotImplementedError
             end.record()
@@ -560,6 +566,160 @@ class PlannerGD(Planner):
             act_seq[:, i, :] = (reward_seqs_weights * act_seqs[:, :, i, :]).sum(0)
         return act_seq
 
+    def _trajectory_optimization_eulerian(
+            self,
+            state_cur_tensor,  # (1, N, 3) – single particle set for seeding initial occ
+            model_dy,          # EulerianModelWrapper
+            act_seq,           # (n_act, 1, action_dim) numpy  (traj_num always 1)
+            n_sample,
+            n_act,
+            n_update_iter,
+            gd_loop,
+            obs_goal,          # (H, W) numpy subgoal
+            time_lim,          # already in seconds
+            device,
+    ):
+        """
+        MPC optimizer that keeps the entire rollout in occupancy-field space.
+
+        Unlike ``trajectory_optimization_ptcl_multi_traj`` (which converts:
+        occ → FPS-particles → occ re-voxelise → pixel projection → reward),
+        this method:
+          1. Converts the current particle observation to an occupancy grid once.
+          2. Rolls-out n_sample candidate action sequences entirely in grid space
+             using ``model_dy.predict_one_step_occ``.
+          3. Measures reward by comparing the predicted occupancy to a
+             precomputed distance-transform score map of the goal
+             (``model_dy.prepare_goal_reward``).  No particle or pixel
+             conversion takes place during the loop.
+
+        The gradient path from ``act_seqs_tensor`` through the user model
+        to the reward is fully differentiable, enabling Adam-based gradient
+        ascent on the action sequence.
+        """
+        # -- 1. Goal score map (precomputed, not differentiated) ---------------
+        score_tensor = model_dy.prepare_goal_reward(
+            obs_goal, self.cam_params, device)            # (*grid_res)
+
+        # -- 2. Initial occupancy state ----------------------------------------
+        occ_init = model_dy.initial_occ_from_particles(
+            state_cur_tensor)                             # (1, *grid_res)
+
+        # -- 3. Action tensor  (n_sample, n_act, action_dim) -------------------
+        acts_np = act_seq[:, 0, :]                        # (n_act, action_dim)
+        act_seqs_np = np.stack([acts_np] * n_sample)      # (n_sample, n_act, action_dim)
+        act_seqs_tensor = torch.tensor(
+            act_seqs_np, device=device, dtype=torch.float, requires_grad=True)
+
+        optimizer = optim.Adam(
+            [act_seqs_tensor],
+            lr=self.config['mpc']['gd']['lr'], betas=(0.9, 0.999))
+
+        rew_mean = np.zeros((1, n_update_iter * gd_loop), dtype=np.float32)
+        rew_std  = np.zeros((1, n_update_iter * gd_loop), dtype=np.float32)
+
+        max_reward   = torch.full((1,), -float('inf'), device=device)
+        best_action  = act_seqs_tensor[0].detach().clone()  # (n_act, action_dim)
+        reward_seqs  = torch.zeros(n_sample, device=device)  # last iter value
+
+        rollout_time = 0.0
+        optim_time   = 0.0
+        start_wall   = time.time()
+
+        iter_bound_by_time = int(
+            time_lim * 1000.0 / particle_num_to_iter_time(self.particle_num))
+        n_iters = min(n_update_iter, iter_bound_by_time)
+        print(f'Eulerian MPC: {n_iters} optimizer iterations')
+        i = 0
+        for i in range(n_iters):
+            # -- rollout n_sample action candidates in occupancy space ---------
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record()
+
+            occ_cur = occ_init.detach().expand(
+                n_sample, *model_dy.grid_res).clone()   # (n_sample, *grid_res)
+
+            for step in range(n_act):
+                occ_cur = model_dy.predict_one_step_occ(
+                    occ_cur, act_seqs_tensor[:, step, :])
+
+            t1.record()
+            torch.cuda.synchronize()
+            rollout_time += t0.elapsed_time(t1)
+
+            # -- reward: sum(occ_pred * score_map) per sample ------------------
+            reward_seqs = (
+                occ_cur * score_tensor
+            ).view(n_sample, -1).sum(-1)                # (n_sample,)
+
+            curr_val, curr_idx = reward_seqs.max(dim=0)
+            if curr_val > max_reward[0]:
+                max_reward[0] = curr_val
+                best_action   = act_seqs_tensor[curr_idx].detach().clone()
+
+            rew_mean[0, i] = reward_seqs.mean().item()
+            rew_std[0, i]  = reward_seqs.std().item()
+
+            # -- gradient step -------------------------------------------------
+            t2 = torch.cuda.Event(enable_timing=True)
+            t3 = torch.cuda.Event(enable_timing=True)
+            t2.record()
+            loss = -reward_seqs.sum()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            t3.record()
+            torch.cuda.synchronize()
+            optim_time += t2.elapsed_time(t3)
+
+            # clip actions to workspace bounds
+            for cvx_i in range(1):
+                x_diff = self.env.cvx_region[cvx_i, 1] - self.env.cvx_region[cvx_i, 0]
+                y_diff = self.env.cvx_region[cvx_i, 3] - self.env.cvx_region[cvx_i, 2]
+                lo = np.array([
+                    self.env.cvx_region[cvx_i, 0],
+                    self.env.cvx_region[cvx_i, 2],
+                    self.env.cvx_region[cvx_i, 0] + x_diff * 0.15,
+                    self.env.cvx_region[cvx_i, 2] + y_diff * 0.15])
+                hi = np.array([
+                    self.env.cvx_region[cvx_i, 1],
+                    self.env.cvx_region[cvx_i, 3],
+                    self.env.cvx_region[cvx_i, 1] - x_diff * 0.15,
+                    self.env.cvx_region[cvx_i, 3] - y_diff * 0.15])
+                for d in range(self.action_dim):
+                    act_seqs_tensor.data[:, :, d].clamp_(min=lo[d], max=hi[d])
+
+        total_time = time.time() - start_wall
+
+        # -- final rollout of best action for logging (observation_sequence) ---
+        occ_cur = occ_init.clone()
+        best_act_t = best_action.unsqueeze(0).to(device)   # (1, n_act, 4)
+        occ_seq = []
+        for step in range(n_act):
+            occ_cur = model_dy.predict_one_step_occ(
+                occ_cur, best_act_t[:, step, :])
+            occ_seq.append(occ_cur.detach().cpu().numpy()[0])  # (*grid_res)
+        obs_seq_best = np.stack(occ_seq)    # (n_act, *grid_res)
+
+        return {
+            'action_sequence':  best_action.cpu().numpy(),             # (n_act, action_dim)
+            'action_full':      act_seqs_tensor.data.cpu().numpy()[:, 0, :],  # (n_sample, action_dim)
+            'reward_full':      reward_seqs.detach().cpu().numpy(),
+            'observation_sequence': obs_seq_best[np.newaxis],          # (1, n_act, *grid_res)
+            'observation_distractor_sequence': None,
+            'reward':           max_reward.cpu().detach().numpy(),
+            'next_r':           max_reward.cpu().detach().numpy(),
+            'rew_mean':         rew_mean,
+            'rew_std':          rew_std,
+            'times': {
+                'total_time':   total_time,
+                'rollout_time': rollout_time,
+                'optim_time':   optim_time,
+            },
+            'iter_num': i,
+        }
+
     def trajectory_optimization_ptcl_multi_traj(self,
                                                 state_cur_np,  # current state, shape: [n_batch, particle_num, 3] numpy array
                                                 state_param, # state_param, shape: [n_batch,]
@@ -627,6 +787,16 @@ class PlannerGD(Planner):
         n_act = act_seq.shape[0]
         traj_num = int(act_seq.shape[1])
         assert n_act == n_look_ahead # the number of actions cannot be less than n_look_ahead
+
+        # Dispatch to the Eulerian optimizer when the model operates in
+        # occupancy-field space.  This avoids the lossy occ→particles→pixel
+        # conversions in the particle path and keeps reward comparison in
+        # the same representation as the model output.
+        if isinstance(model_dy, EulerianModelWrapper):
+            return self._trajectory_optimization_eulerian(
+                state_cur_tensor[0:1], model_dy, act_seq,
+                n_sample, n_act, n_update_iter, gd_loop,
+                obs_goal, time_lim, device)
         if DEBUG:
             # Input check begin
             print('-----------------')

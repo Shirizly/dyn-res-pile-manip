@@ -2119,16 +2119,18 @@ void ReshapeWindow(int width, int height) {
     if (!g_benchmark)
         printf("Reshaping\n");
 
-    ReshapeRender(g_window);
+    // Always render at the programmatically configured resolution (g_screenWidth x g_screenHeight),
+    // which is set by Python via pyflex.set_screenWidth/Height() before pyflex.init().
+    // Physical window/drawable dimensions (HiDPI, WM maximise, etc.) are intentionally ignored:
+    //   - keeps capture resolution stable and matching the Python-requested size,
+    //   - avoids recreating g_fluidRenderer on every WM SDL_WINDOWEVENT_SIZE_CHANGED event,
+    //   - prevents large-framebuffer readback overhead on HiDPI displays.
+    ReshapeRenderSize(g_screenWidth, g_screenHeight);
 
-    if (!g_fluidRenderer || (width != g_screenWidth || height != g_screenHeight)) {
-        if (g_fluidRenderer)
-            DestroyFluidRenderer(g_fluidRenderer);
-        g_fluidRenderer = CreateFluidRenderer(width, height);
+    if (!g_fluidRenderer) {
+        g_fluidRenderer = CreateFluidRenderer(g_screenWidth, g_screenHeight);
     }
-
-    g_screenWidth = width;
-    g_screenHeight = height;
+    // g_screenWidth / g_screenHeight are NOT updated here — they keep their configured values.
 }
 
 void InputArrowKeysDown(int key, int x, int y) {
@@ -3541,6 +3543,15 @@ int pyflex_get_screenHeight() {
     return g_screenHeight;
 }
 
+// Resize both the GL viewport/MSAA FBO and the readback dimensions together.
+// Call this when you want to render at a specific resolution (e.g., the save
+// resolution) rather than the native HiDPI display size.
+void pyflex_set_render_size(int w, int h) {
+    ReshapeRenderSize(w, h);
+    g_screenWidth = w;
+    g_screenHeight = h;
+}
+
 void pyflex_set_hideShapes(py::array_t<float> hideShapes) {
     auto buf = hideShapes.request();
     auto ptr = (float *) buf.ptr;
@@ -3736,6 +3747,26 @@ py::array_t<float> pyflex_render(
 
     if (g_benchmark) newScene = BenchmarkUpdate();
 
+    // ---- Capture framebuffer BEFORE PresentFrame (swap) and SDL_EventFunc ----
+    // Reading after swap gives undefined back-buffer content on many drivers/compositors.
+    // Reading after SDL_EventFunc risks dimension changes between render and readback.
+    // Save current dimensions since SDL_EventFunc may change g_screenWidth/Height.
+    int captureWidth = g_screenWidth;
+    int captureHeight = g_screenHeight;
+    int num_ch;
+    if (render_depth) {
+        num_ch = 5;
+    } else {
+        num_ch = 4;
+    }
+    auto rgb_data = new unsigned char[captureWidth * captureHeight * 4];
+    auto depth_data = new float[captureWidth * captureHeight];
+    float z_near = g_camNear;
+    float z_far = g_camFar;
+
+    ReadFrame((int *)rgb_data, captureWidth, captureHeight);
+    ReadDepth((float *)depth_data, captureWidth, captureHeight);
+
     // flush out the last frame before freeing up resources in the event of a scene change
     // this is necessary for d3d12
     PresentFrame(g_vsync);
@@ -3748,38 +3779,22 @@ py::array_t<float> pyflex_render(
 
     SDL_EventFunc();
 
-
-    // capture rgb
-    int num_ch;
-    if (render_depth) {
-        num_ch = 5;
-    } else {
-        num_ch = 4;
-    }
-    auto rgb_data = new unsigned char[g_screenWidth * g_screenHeight * 4];
-    auto depth_data = new float[g_screenWidth * g_screenHeight];
-    float z_near = g_camNear;
-    float z_far = g_camFar;
-
-    ReadFrame((int *)rgb_data, g_screenWidth, g_screenHeight);
-    ReadDepth((float *)depth_data, g_screenWidth, g_screenHeight);
-
-    auto img = py::array_t<float>((size_t) g_screenWidth * g_screenHeight * num_ch);
+    auto img = py::array_t<float>((size_t) captureWidth * captureHeight * num_ch);
     auto ptr = (float *) img.request().ptr;
 
-    for (int i = 0; i < g_screenHeight; ++i) {
-        for (int j = 0; j < g_screenWidth; ++j) {
+    for (int i = 0; i < captureHeight; ++i) {
+        for (int j = 0; j < captureWidth; ++j) {
             for (int k = 0; k < 3; ++k) {
-                int idx_src = i * g_screenWidth * 4 + j * 4 + k;
-                int idx_des = (g_screenHeight - i - 1) * g_screenWidth * num_ch + j * num_ch + k;
+                int idx_src = i * captureWidth * 4 + j * 4 + k;
+                int idx_des = (captureHeight - i - 1) * captureWidth * num_ch + j * num_ch + k;
                 ptr[idx_des] = rgb_data[idx_src];
             }
             if (render_depth) {
-                int idx_des = (g_screenHeight - i - 1) * g_screenWidth * num_ch + j * num_ch + num_ch - 1;
-                float z = depth_data[i * g_screenWidth + j];
+                int idx_des = (captureHeight - i - 1) * captureWidth * num_ch + j * num_ch + num_ch - 1;
+                float z = depth_data[i * captureWidth + j];
                 z = (2.0*z)-1.0;
                 ptr[idx_des] = ( 2.0 * z_near * z_far) / ( z_far + z_near - z * ( z_far - z_near ) );
-                // ptr[idx_des] = depth_data[i * g_screenWidth + j];
+                // ptr[idx_des] = depth_data[i * captureWidth + j];
             }
         }
     }
@@ -3870,6 +3885,10 @@ PYBIND11_MODULE(pyflex, m) {
 
     m.def("set_screenWidth", &pyflex_set_screenWidth);
     m.def("set_screenHeight", &pyflex_set_screenHeight);
+
+    m.def("set_render_size", &pyflex_set_render_size,
+          "Resize GL viewport + MSAA FBO + readback dims atomically. "
+          "Use before rendering when you want a specific resolution.");
 
     m.def("set_floorScaleSize", &pyflex_set_floorScaleSize);
     m.def("get_floorScaleSize", &pyflex_get_floorScaleSize);

@@ -48,7 +48,12 @@ DemoContext* GetDemoContext()
 void ReshapeRender(SDL_Window* window)
 {
 	int width, height;
-	SDL_GetWindowSize(window, &width, &height);
+	SDL_GL_GetDrawableSize(window, &width, &height);
+	s_context->onSizeChanged(width, height, false);
+}
+
+void ReshapeRenderSize(int width, int height)
+{
 	s_context->onSizeChanged(width, height, false);
 }
 

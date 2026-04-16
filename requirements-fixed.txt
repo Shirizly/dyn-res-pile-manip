@@ -1,0 +1,23 @@
+# Requirements for dyn-res-pile-manip
+# Install PyTorch first from PyTorch index:
+# pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+
+# Install DGL with CUDA support:
+# pip install dgl==2.1.0 -f https://data.dgl.ai/wheels/cu118/repo.html
+
+# Then install remaining packages
+numpy<2
+torchdata==0.7.1
+pydantic
+nvidia-cusparse-cu11
+scipy
+opencv-python
+matplotlib
+pybullet
+gym
+beautifulsoup4
+open3d
+PyYAML
+lxml
+gdown
+scikit-optimize

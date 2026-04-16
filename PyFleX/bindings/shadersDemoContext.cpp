@@ -52,6 +52,11 @@ void ReshapeRender(SDL_Window* window)
 	s_context->onSizeChanged(width, height, false);
 }
 
+void ReshapeRenderSize(int width, int height)
+{
+	s_context->onSizeChanged(width, height, false);
+}
+
 void DestroyRender()
 {
 	if (s_context)

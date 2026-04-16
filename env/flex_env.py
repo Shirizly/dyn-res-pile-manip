@@ -187,7 +187,20 @@ class FlexEnv(gym.Env):
         pyflex.set_screenHeight(self.screenHeight)
         pyflex.set_light_dir(np.array([0.1, 2.0, 0.1]))
         pyflex.set_light_fov(70.)
+        
+        # Warn about headless mode issues
+        if config['dataset']['headless']:
+            print("WARNING: PyFleX headless mode may cause OpenGL shader errors.")
+            print("         If you encounter crashes, set headless: False in config")
+            print("         or run with: xvfb-run -a python your_script.py")
+        
         pyflex.init(config['dataset']['headless'])
+
+        # Store the native render dimensions reported by PyFleX after init.
+        # On HiDPI displays these will be larger than self.screenWidth/Height.
+        # Used by set_save_render_mode() / restore_native_render_mode().
+        self._native_render_width = pyflex.get_screenWidth()
+        self._native_render_height = pyflex.get_screenHeight()
 
         # set up camera
         cam_idx = config['dataset']['cam_idx']
@@ -308,10 +321,12 @@ class FlexEnv(gym.Env):
                 if video_recorder:
                     obs = self.render(add_cam_idx=add_cam_idx)
                     if not isinstance(obs, list):
-                        video_recorder[0].write(obs[..., :3][..., ::-1].astype(np.uint8))
+                        video_recorder[0].write(np.ascontiguousarray(
+                            np.clip(obs[..., :3][..., ::-1], 0, 255).astype(np.uint8)))
                     else:
                         for i, obs_i in enumerate(obs):
-                            video_recorder[i].write(obs_i[..., :3][..., ::-1].astype(np.uint8))
+                            video_recorder[i].write(np.ascontiguousarray(
+                                np.clip(obs_i[..., :3][..., ::-1], 0, 255).astype(np.uint8)))
                 pyflex.step()
                 if math.isnan(self.get_positions().reshape(-1, 4)[:, 0].max()):
                     print('simulator exploded when action is ', action)
@@ -323,10 +338,12 @@ class FlexEnv(gym.Env):
             if video_recorder:
                 obs = self.render(add_cam_idx=add_cam_idx)
                 if not isinstance(obs, list):
-                    video_recorder[0].write(obs[..., :3][..., ::-1].astype(np.uint8))
+                    video_recorder[0].write(np.ascontiguousarray(
+                        np.clip(obs[..., :3][..., ::-1], 0, 255).astype(np.uint8)))
                 else:
                     for i, obs_i in enumerate(obs):
-                        video_recorder[i].write(obs_i[..., :3][..., ::-1].astype(np.uint8))
+                        video_recorder[i].write(np.ascontiguousarray(
+                            np.clip(obs_i[..., :3][..., ::-1], 0, 255).astype(np.uint8)))
             pyflex.step()
         obs = self.render(add_cam_idx=add_cam_idx)
 
@@ -871,21 +888,91 @@ class FlexEnv(gym.Env):
         self.last_ee = None
         self.reset_panda()
 
+    def set_save_render_mode(self):
+        """Switch GL viewport + MSAA FBO to the save resolution (screenWidth x screenHeight).
+
+        Call this before a MPC/data-gen run when saving images or video so that
+        renders happen at exactly the target save size — no downscaling artefacts.
+        Requires PyFleX to have been rebuilt with pyflex.set_render_size().
+        On older builds the call is silently skipped (renders remain at native size).
+        """
+        if not hasattr(pyflex, 'set_render_size'):
+            return
+        if pyflex.get_screenWidth() != self.screenWidth or pyflex.get_screenHeight() != self.screenHeight:
+            pyflex.set_render_size(self.screenWidth, self.screenHeight)
+
+    def restore_native_render_mode(self):
+        """Restore GL viewport + MSAA FBO to the native display size.
+
+        Call this after saving is done to return to full-resolution display quality.
+        """
+        if not hasattr(pyflex, 'set_render_size'):
+            return
+        if pyflex.get_screenWidth() != self._native_render_width or \
+                pyflex.get_screenHeight() != self._native_render_height:
+            pyflex.set_render_size(self._native_render_width, self._native_render_height)
+
+    def _process_render_output(self, render_output):
+        """Reshape and resize render output to (screenHeight, screenWidth, 5).
+        
+        Uses pyflex.get_screenWidth/Height() for correct dimensions when
+        the actual render size differs from the requested size (HiDPI/scaling).
+        """
+        total_size = render_output.size
+        expected_size = self.screenHeight * self.screenWidth * 5
+        
+        if total_size != expected_size:
+            # Use the actual C++ dimensions for reshape (more reliable than guessing)
+            actual_width = pyflex.get_screenWidth()
+            actual_height = pyflex.get_screenHeight()
+            
+            if actual_width * actual_height * 5 != total_size:
+                # C++ dims don't match (dims may have changed during render).
+                # Fall back to factoring.
+                actual_pixels = total_size // 5
+                import math
+                best_h, best_w, best_aspect = None, None, float('inf')
+                for h in range(1, int(math.sqrt(actual_pixels)) + 1):
+                    if actual_pixels % h == 0:
+                        w = actual_pixels // h
+                        ar = max(w, h) / min(w, h)
+                        if ar < best_aspect:
+                            best_aspect, best_h, best_w = ar, h, w
+                actual_height, actual_width = best_h, best_w
+            
+            img = render_output.reshape(actual_height, actual_width, 5)
+            # .copy() is needed: slicing a 5-channel array creates non-contiguous views
+            # that cv2.resize misinterprets.
+            img_resized = cv2.resize(img[..., :4].copy(),
+                                     (self.screenWidth, self.screenHeight),
+                                     interpolation=cv2.INTER_AREA)
+            depth_resized = cv2.resize(img[..., 4].copy(),
+                                       (self.screenWidth, self.screenHeight),
+                                       interpolation=cv2.INTER_NEAREST)
+            if depth_resized.ndim == 2:
+                depth_resized = depth_resized[..., np.newaxis]
+            return np.concatenate([img_resized, depth_resized], axis=2)
+        else:
+            return render_output.reshape(self.screenHeight, self.screenWidth, 5)
+
     def render(self, no_return=False, add_cam_idx=None):
         # RGB scale: 0-255
         # Depth scale: float in meters
         pyflex.step()
-        # color, depth = pyflex.render(render_depth=True)
-        # img = np.concatenate([color.reshape(self.screenHeight, self.screenWidth, 4), depth.reshape(self.screenHeight, self.screenWidth, 1)], axis=2)
-        # return img.reshape(self.screenHeight, self.screenWidth, 5)
         if no_return:
             return
         else:
             if add_cam_idx is None:
-                return pyflex.render(render_depth=True).reshape(self.screenHeight, self.screenWidth, 5)
+                render_output = pyflex.render(render_depth=True)
+                return self._process_render_output(render_output)
             else:
                 imgs = []
-                imgs.append(pyflex.render(render_depth=True).reshape(self.screenHeight, self.screenWidth, 5))
+                
+                # First camera (default position)
+                render_output = pyflex.render(render_depth=True)
+                imgs.append(self._process_render_output(render_output))
+                    
+                # Additional cameras
                 for cam_idx in add_cam_idx:
                     rad = np.deg2rad(cam_idx * 45.)
                     cam_dis = 7.0 * self.global_scale / 8.0
@@ -894,7 +981,10 @@ class FlexEnv(gym.Env):
                     camAngle = np.array([rad, -np.deg2rad(25.), 0.])
                     pyflex.set_camPos(camPos)
                     pyflex.set_camAngle(camAngle)
-                    imgs.append(pyflex.render(render_depth=True).reshape(self.screenHeight, self.screenWidth, 5))
+                    render_output = pyflex.render(render_depth=True)
+                    imgs.append(self._process_render_output(render_output))
+                
+                # Reset camera to original position
                 pyflex.set_camPos(self.camPos)
                 pyflex.set_camAngle(self.camAngle)
                 return imgs
@@ -966,7 +1056,8 @@ class FlexEnv(gym.Env):
                           action_seq_mpc_init=None,
                           action_label_seq_mpc_init=None,
                           time_lim=float('inf'),
-                          auto_particle_r=False,):
+                          auto_particle_r=False,
+                          video_recorder=None,):
         assert type(subgoal) == np.ndarray
         assert subgoal.shape == (self.screenHeight, self.screenWidth)
         # planner
@@ -1073,7 +1164,7 @@ class FlexEnv(gym.Env):
             print('mpc_step:', i)
             print('action:', action_seq_mpc[0])
             
-            obs_cur = self.step(action_seq_mpc[0])
+            obs_cur = self.step(action_seq_mpc[0], video_recorder=video_recorder)
             if obs_cur is None:
                 raise Exception('sim exploded')
 

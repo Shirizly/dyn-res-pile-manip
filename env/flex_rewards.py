@@ -175,7 +175,7 @@ def config_reward_ptcl(state, goal, cam_params, goal_coor, normalize=True, offse
     goal_np = goal_np - neg_goal_dist
     goal_np = goal_np - goal_np.min()
     goal = torch.from_numpy(goal_np).to(device = state.device, dtype = state.dtype)
-    goal = torch.tile(goal[None, None, ...], (B, 1, 1, 1)) # (B, 1, H, W)
+    goal = goal[None, None, ...].expand(B, 1, H, W)  # (B, 1, H, W) - broadcast view, no copy
 
     # downsample goal_coor to the same scale as state
     # goal_coor_idx = farthest_point_sampler(goal_coor[None, ...].to(device = 'cpu', dtype = torch.float32), N)[0]
