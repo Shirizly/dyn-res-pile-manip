@@ -21,6 +21,7 @@ dataset:
   init_pos: 'rand_spread'
   global_scale: 24          # 12 (ball, coffee); 24 (carrots, capsule)
   obj: "carrots"            # "coffee"; "ball"; "capsule"; "carrots"
+  num_objects: 100          # ← spawns exactly 100 carrots every reset
   particle_r: 0.125
   cam_idx: 0
   num_worker: 4
@@ -28,13 +29,23 @@ dataset:
   headless: False
   cont_motion: False
   robot_type: 'franka'
+  render_width: 720
+  render_height: 720
+  fast_mode: False                # if True: faster defaults for step size + settling
+  action_step_size: 0.02          # larger => fewer IK interpolation steps (faster)
+  settle_steps: 200               # fewer post-action settle steps => faster
+  reset_warmup_steps: 500         # fewer reset warmup steps => faster episode reset
+  render_step_before_capture: True  # disable for extra speed if physics already stepped
+  # num_objects: 50         # uncomment to fix the number of carrots/capsules spawned
+                            # (overrides the grid-derived count computed from init_pos)
 
 mpc:
   # ── core MPC parameters ────────────────────────────────────────────────────
-  n_mpc: 10           # number of real-world steps to execute
-  n_look_ahead: 1    # planning horizon (steps rolled out in grid space)
+  n_mpc: 5           # number of real-world steps to execute
+  n_look_ahead: 1    # planning horizon (steps rolled out in model space)
   n_sample: 512       # candidates per optimizer call (each randomly initialised)
   n_update_iter: 100  # Adam iterations per MPC step
+  particle_num: 30   # GNN adapter: fixed particle count per observation
 
   # ── debug visualization ────────────────────────────────────────────────────
   # Produces two kinds of outputs per MPC step (when enabled: True):
@@ -60,7 +71,7 @@ mpc:
     output_dir: 'outputs/simple_mpc_debug'
     top_k: 5                  # candidates shown per snapshot
     save_every_n_iters: 25    # snapshot frequency (also always saves iter 0 and last)
-    benchmark_throughput: True  # set True once to print candidates/sec table at startup
+    benchmark_throughput: True  # set True to print candidates/sec table at experiment startup
 
   # ── reward shaping ───────────────────────────────────────────────────
   # empty_penalty > 0: non-goal voxels carry negative score proportional to

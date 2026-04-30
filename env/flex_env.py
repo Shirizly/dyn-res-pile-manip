@@ -171,15 +171,38 @@ class FlexEnv(gym.Env):
         self.planeId = p.loadURDF("plane.urdf")
 
         # set up pyflex
-        self.screenWidth = 720
-        self.screenHeight = 720
+        self.screenWidth = int(config['dataset'].get('render_width', 720))
+        self.screenHeight = int(config['dataset'].get('render_height', 720))
         self.wkspc_w = config['dataset']['wkspc_w']
         self.headless = config['dataset']['headless']
+        headless_override = os.getenv('PYFLEX_HEADLESS_OVERRIDE')
+        if headless_override is not None:
+            self.headless = headless_override.strip().lower() in ('1', 'true', 'yes', 'on')
         self.obj = config['dataset']['obj']
         self.global_scale = config['dataset']['global_scale']
         self.cont_motion = config['dataset']['cont_motion']
         self.init_pos = config['dataset']['init_pos']
         self.robot_type = config['dataset']['robot_type']
+        self.fast_mode = bool(config['dataset'].get('fast_mode', False))
+        self.render_step_before_capture = bool(
+            config['dataset'].get('render_step_before_capture', True)
+        )
+
+        # Tuning knobs for simulation speed. Defaults preserve current behavior.
+        default_action_step_size = 1.0 / 35.0 if self.fast_mode else 1.0 / 50.0
+        default_settle_steps = 50 if self.fast_mode else 200
+        default_reset_warmup_steps = 200 if self.fast_mode else 500
+        self.action_step_size = float(
+            config['dataset'].get('action_step_size', default_action_step_size)
+        )
+        self.settle_steps = int(config['dataset'].get('settle_steps', default_settle_steps))
+        self.reset_warmup_steps = int(
+            config['dataset'].get('reset_warmup_steps', default_reset_warmup_steps)
+        )
+        # Optional override: set dataset.num_objects in config to fix the
+        # number of objects spawned (carrots / capsules).  When absent the
+        # grid-derived count is used as before.
+        self.num_objects_override = config['dataset'].get('num_objects', None)
         self.img_channel = 1
         self.config = config
 
@@ -189,12 +212,12 @@ class FlexEnv(gym.Env):
         pyflex.set_light_fov(70.)
         
         # Warn about headless mode issues
-        if config['dataset']['headless']:
+        if self.headless:
             print("WARNING: PyFleX headless mode may cause OpenGL shader errors.")
             print("         If you encounter crashes, set headless: False in config")
             print("         or run with: xvfb-run -a python your_script.py")
         
-        pyflex.init(config['dataset']['headless'])
+        pyflex.init(self.headless)
 
         # Store the native render dimensions reported by PyFleX after init.
         # On HiDPI displays these will be larger than self.screenWidth/Height.
@@ -299,7 +322,7 @@ class FlexEnv(gym.Env):
         else:
             way_pts = [s_2d + np.array([0., 0., self.global_scale / 24.0]), s_2d, e_2d, e_2d + np.array([0., 0., self.global_scale / 24.0])]
             self.reset_panda(self.rest_joints)
-        speed = 1.0/50.
+        speed = self.action_step_size
         for i_p in range(len(way_pts)-1):
             s = way_pts[i_p]
             e = way_pts[i_p+1]
@@ -334,7 +357,7 @@ class FlexEnv(gym.Env):
             self.last_ee = end_effector_pos.copy()
         if not self.cont_motion:
             self.reset_panda()
-        for i in range(200):
+        for i in range(self.settle_steps):
             if video_recorder:
                 obs = self.render(add_cam_idx=add_cam_idx)
                 if not isinstance(obs, list):
@@ -431,6 +454,8 @@ class FlexEnv(gym.Env):
             dynamicFriction = 1.0
             draw_skin = 1.0
             num_coffee = 1000 # [200, 1000]
+            if self.num_objects_override is not None:
+                num_coffee = int(self.num_objects_override)
             self.scene_params = np.array([
                 scale, x, y, z, staticFriction, dynamicFriction, draw_skin, num_coffee])
             pyflex.set_scene(20, self.scene_params, 0)
@@ -457,6 +482,8 @@ class FlexEnv(gym.Env):
             dynamicFriction = 0.5
             draw_skin = 1.0
             num_capsule = 200 # [200, 1000]
+            if self.num_objects_override is not None:
+                num_capsule = int(self.num_objects_override)
             slices = 10
             segments = 20
             self.scene_params = np.array([
@@ -811,6 +838,9 @@ class FlexEnv(gym.Env):
                                           add_sing_y,
                                           add_sing_z,
                                           add_noise,])
+            if self.num_objects_override is not None:
+                # yx_carrots scene expects num_carrots at ptr[8] (ptr[7] is draw_skin).
+                self.scene_params[8] = int(self.num_objects_override)
             pyflex.set_scene(22, self.scene_params, 0)
         elif self.obj == 'coffee_capsule':
             cof_scale = 0.2 * self.global_scale / 8.0
@@ -838,7 +868,7 @@ class FlexEnv(gym.Env):
         pyflex.set_camPos(self.camPos)
         pyflex.set_camAngle(self.camAngle)
 
-        for i in range(500):
+        for i in range(self.reset_warmup_steps):
             pyflex.step()
 
         # add wall
@@ -958,7 +988,8 @@ class FlexEnv(gym.Env):
     def render(self, no_return=False, add_cam_idx=None):
         # RGB scale: 0-255
         # Depth scale: float in meters
-        pyflex.step()
+        if self.render_step_before_capture:
+            pyflex.step()
         if no_return:
             return
         else:
@@ -1233,6 +1264,10 @@ class FlexEnv(gym.Env):
         return [fx, fy, cx, cy]
     
     def get_cam_extrinsics(self):
+        # Camera position/angle are set during reset(), but set them here so
+        # callers before the first reset() (e.g. load_model) get a valid matrix.
+        pyflex.set_camPos(self.camPos)
+        pyflex.set_camAngle(self.camAngle)
         return np.array(pyflex.get_viewMatrix()).reshape(4, 4).T
     
     def get_positions(self):

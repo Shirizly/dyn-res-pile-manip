@@ -1,5 +1,6 @@
 *.avi
 data/*
+outputs/*
 build/
 dist/
 *.egg-info
@@ -10,4 +11,6 @@ dist/
 *.mp4
 *.zip
 __pycache__/
+*.YAML
+*.yaml
 

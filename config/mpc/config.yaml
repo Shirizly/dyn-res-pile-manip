@@ -13,6 +13,8 @@ dataset:
   headless: False
   cont_motion: False # whether the robot action is continuous
   robot_type: 'franka' # kinova; franka
+  # num_objects: 50   # uncomment to fix the number of carrots/capsules spawned
+                      # (overrides the grid-derived count computed from init_pos)
 
 mpc:
   sigma: 0.3

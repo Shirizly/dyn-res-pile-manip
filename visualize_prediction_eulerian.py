@@ -35,13 +35,13 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 from env.flex_env import FlexEnv
-from model.gnn_dyn import PropNetDiffDenModel
 from model.eulerian_wrapper import (
     EulerianModelWrapper, SplatPushModel, FluidPushModel,SpreadPushModel,
     _action_to_cam_3d,
 )
 from utils import (load_yaml, get_current_YYYY_MM_DD_hh_mm_ss_ms,
-                   pcd2pix, gen_goal_shape, gen_subgoal, depth2fgpcd)
+                   pcd2pix, gen_goal_shape, gen_subgoal,
+                   scale_subgoal_to_material_pixels)
 
 
 # ── Eulerian model configuration (mirrors visualize_mpc.py) ──────────────────
@@ -55,8 +55,8 @@ GRID_RES = (64, 64)
 USE_SIMPLE_MPC    = True
 SIMPLE_MPC_CONFIG = 'config/mpc/config_simple.yaml'
 
-TOOL_WIDTH              = 8.0
-ACTION_SIGMA              = 1.5
+TOOL_WIDTH              = 5.0
+ACTION_SIGMA              = 0.5
 SPLAT_REDISTRIBUTE       = False
 SPLAT_REDISTRIBUTE_ITERS = 10
 
@@ -69,50 +69,6 @@ FLUID_BLUR_SIGMA         = 1.0
 FLUID_CORRECT_DIVERGENCE = False
 FLUID_REDISTRIBUTE       = False
 FLUID_REDISTRIBUTE_ITERS = 10
-# ─────────────────────────────────────────────────────────────────────────────
-def _scale_subgoal_to_material(
-    subgoal_dist: np.ndarray,  # (H, W)  distance-transform, 0 = goal interior
-    occ_init_np:  np.ndarray,  # (Nx, Ny) occupancy of the initial granular pile
-    model_dy:     EulerianModelWrapper,
-    cam_params,
-) -> np.ndarray:
-    """
-    Rescale the goal shape in pixel space so its projected voxel footprint
-    on the occupancy grid matches the material's occupied area.
-
-    Algorithm
-    ---------
-    1. Back-project the raw goal pixels onto the 64×64 grid → n_goal voxels.
-    2. Count occupied voxels in occ_init_np  → n_mat voxels.
-    3. scale = sqrt(n_mat / n_goal)  (area ∝ scale²).
-    4. Warp the binary goal mask around the image centre by that scale.
-    5. Recompute the distance transform on the scaled mask.
-    """
-    H, W = subgoal_dist.shape
-
-    occ_goal_raw = model_dy.subgoal_mask_to_occupancy(subgoal_dist, cam_params)
-    n_goal = float((occ_goal_raw[0] > 0.1).sum().item())
-    n_mat  = float((torch.from_numpy(occ_init_np) > 0.1).sum().item())
-
-    if n_goal < 1 or n_mat < 1:
-        print('[goal scale] cannot estimate areas; skipping scaling.')
-        return subgoal_dist
-
-    scale = (n_mat / n_goal) ** 0.5
-    print(f'[goal scale] goal_vox={n_goal:.0f}  mat_vox={n_mat:.0f}  scale={scale:.3f}')
-
-    if abs(scale - 1.0) < 0.02:
-        return subgoal_dist
-
-    goal_mask   = (subgoal_dist < 0.5).astype(np.uint8)
-    M           = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), 0.0, float(scale))
-    scaled_mask = cv2.warpAffine(goal_mask, M, (W, H),
-                                 flags=cv2.INTER_LINEAR,
-                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    scaled_mask = (scaled_mask > 0.5).astype(np.uint8)
-    scaled_dist = np.minimum(
-        cv2.distanceTransform(1 - scaled_mask, cv2.DIST_L2, 5), 1e4)
-    return scaled_dist.astype(np.float32)
 
 # ─────────────────────────────────────────────────────────── occ helpers ─────
 
@@ -536,14 +492,10 @@ def main():
     # ── pre-compute goal score map (diagnostic: verify goal is correctly captured) ──
     cam_params = env.get_cam_params()
 
-    # Scale goal shape so its grid footprint matches the actual material area.
-    obs_init   = env.render()
-    depth_init = obs_init[..., -1] / global_scale
-    pts_init   = depth2fgpcd(depth_init, depth_init < 0.599 / 0.8, cam_params)
-    pts_t      = torch.from_numpy(pts_init).float().cuda().unsqueeze(0)
-    with torch.no_grad():
-        occ_init_np = model_dy.initial_occ_from_particles(pts_t)[0].cpu().numpy()
-    subgoal = _scale_subgoal_to_material(subgoal, occ_init_np, model_dy, cam_params)
+    # Scale goal shape so its pixel footprint matches the actual material area.
+    obs_init = env.render()
+    subgoal  = scale_subgoal_to_material_pixels(
+        subgoal, obs_init[..., -1], global_scale)
 
     score_tensor = model_dy.prepare_goal_reward(subgoal, cam_params, device='cpu')
     score_np     = score_tensor.numpy()   # (Nx, Ny)

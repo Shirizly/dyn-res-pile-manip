@@ -237,6 +237,72 @@ def to_np(x):
     return x.detach().cpu().numpy()
 
 
+# ── Foreground threshold used across all scripts ──────────────────────────────
+# A depth value (normalised by global_scale) below this threshold is treated as
+# foreground material.  Must match the threshold used in FlexEnv and data_gen.
+_FG_DEPTH_THRESHOLD = 0.599 / 0.8   # ≈ 0.749
+
+
+def scale_subgoal_to_material_pixels(
+    subgoal_dist: np.ndarray,  # (H, W) float32 — distance transform, 0 = goal interior
+    obs_depth:    np.ndarray,  # (H, W) float   — raw depth channel from env.render()[..., -1]
+    global_scale: float,
+) -> np.ndarray:
+    """
+    Rescale the goal shape in pixel space so its pixel-area matches the
+    foreground material area in the initial rendered observation.
+
+    This is a model-independent version that works for both the particle-based
+    (GNN) and the Eulerian visualize_prediction scripts.
+
+    Algorithm
+    ---------
+    1. Threshold the depth channel to get a foreground material mask (n_mat).
+    2. Count goal pixels  (subgoal_dist < 0.5)  →  n_goal.
+    3. scale = sqrt(n_mat / n_goal)   (area ∝ scale²).
+    4. Warp the binary goal mask around the image centre by that scale factor.
+    5. Recompute the distance transform on the scaled mask.
+
+    Parameters
+    ----------
+    subgoal_dist : (H, W) float32
+        Distance-transform array where values < 0.5 are inside the goal shape.
+    obs_depth : (H, W) float
+        Raw depth channel from env.render()[..., -1].
+    global_scale : float
+        config['dataset']['global_scale'] — used to normalize the depth channel.
+
+    Returns
+    -------
+    (H, W) float32 distance transform of the rescaled goal mask.
+    """
+    H, W = subgoal_dist.shape
+
+    fg_mask  = (obs_depth / global_scale < _FG_DEPTH_THRESHOLD)
+    n_mat    = float(fg_mask.sum())
+    goal_bin = (subgoal_dist < 0.5).astype(np.uint8)
+    n_goal   = float(goal_bin.sum())
+
+    if n_goal < 1 or n_mat < 1:
+        print('[goal scale] cannot estimate areas — skipping scaling.')
+        return subgoal_dist
+
+    scale = (n_mat / n_goal) ** 0.5
+    print(f'[goal scale] goal_px={n_goal:.0f}  mat_px={n_mat:.0f}  scale={scale:.3f}')
+
+    if abs(scale - 1.0) < 0.02:
+        return subgoal_dist
+
+    M           = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), 0.0, float(scale))
+    scaled_mask = cv2.warpAffine(goal_bin, M, (W, H),
+                                 flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    scaled_mask = (scaled_mask > 0.5).astype(np.uint8)
+    scaled_dist = np.minimum(
+        cv2.distanceTransform(1 - scaled_mask, cv2.DIST_L2, 5), 1e4)
+    return scaled_dist.astype(np.float32)
+
+
 def combine_stat(stat_0, stat_1):
     mean_0, std_0, n_0 = stat_0[:, 0], stat_0[:, 1], stat_0[:, 2]
     mean_1, std_1, n_1 = stat_1[:, 0], stat_1[:, 1], stat_1[:, 2]

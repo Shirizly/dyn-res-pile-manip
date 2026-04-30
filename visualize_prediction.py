@@ -12,16 +12,10 @@ For each MPC step this script produces a side-by-side comparison panel:
              • cyan  dots = model-predicted particle positions
              • red   dots = actual extracted particle positions
 
-The script delegates all MPC logic to env.step_subgoal_ptcl() and then
-generates the per-step visualisations from the returned data.
-
-Configuration is read from config/mpc/config.yaml, with an optional
-sub-key  mpc.prediction_viz  for overrides:
+Configuration is read from config/mpc/config_simple.yaml, with an optional
+sub-key  mpc.prediction_viz for display overrides:
 
   prediction_viz:
-    n_mpc:          5       # number of MPC steps (overrides mpc.n_mpc)
-    n_sample:       20      # rollout samples per optimisation iteration
-    n_update_iter:  50      # gradient-descent iterations per MPC step
     output_dir:     outputs/prediction_viz
     video_fps:      2
 
@@ -41,7 +35,11 @@ import matplotlib.pyplot as plt
 from env.flex_env import FlexEnv
 from model.gnn_dyn import PropNetDiffDenModel
 from utils import (load_yaml, get_current_YYYY_MM_DD_hh_mm_ss_ms,
-                   pcd2pix, gen_goal_shape, gen_subgoal)
+                   pcd2pix, gen_goal_shape, gen_subgoal,
+                   scale_subgoal_to_material_pixels)
+from simple_mpc import run_simple_mpc
+
+SIMPLE_MPC_CONFIG = 'config/mpc/config_simple.yaml'
 
 
 # ─────────────────────────────────────────────────────────────── helpers ─────
@@ -135,17 +133,10 @@ def make_panel(img_cur_rgb: np.ndarray,
 # ─────────────────────────────────────────────────────────────── main ────────
 
 def main():
-    config = load_yaml("config/mpc/config.yaml")
+    config = load_yaml(SIMPLE_MPC_CONFIG)
 
-    # ── read prediction_viz overrides (fall back to mpc-level values) ────────
+    # ── prediction_viz display overrides ──────────────────────────────────
     pv            = config['mpc'].get('prediction_viz', {})
-    n_mpc         = pv.get('n_mpc',         config['mpc']['n_mpc'])
-    n_look_ahead  = pv.get('n_look_ahead',  config['mpc']['n_look_ahead'])
-    n_sample      = pv.get('n_sample',      config['mpc']['n_sample'])
-    n_update_iter = pv.get('n_update_iter', config['mpc']['n_update_iter'])
-    gd_loop       = pv.get('gd_loop',       config['mpc']['gd_loop'])
-    mpc_type      = pv.get('mpc_type',      config['mpc']['mpc_type'])
-    time_lim      = pv.get('time_lim',      config['mpc'].get('time_lim', float('inf')))
     output_base   = pv.get('output_dir',    'outputs/prediction_viz')
     video_fps     = pv.get('video_fps',     2)
 
@@ -179,38 +170,23 @@ def main():
 
     env.reset()
 
+    # Scale goal so its pixel footprint matches the material area.
+    obs_init = env.render()
+    subgoal  = scale_subgoal_to_material_pixels(
+        subgoal, obs_init[..., -1], config['dataset']['global_scale'])
+
     # ── output directory ──────────────────────────────────────────────────────
     timestamp = get_current_YYYY_MM_DD_hh_mm_ss_ms()
     run_dir = os.path.join(output_base, f'run_{timestamp}')
     os.makedirs(run_dir, exist_ok=True)
     print(f"Saving to: {run_dir}\n")
 
-    funnel_dist = np.zeros_like(subgoal)
-    action_seq_init = np.load(f'init_action/init_action_{n_sample}.npy')[np.newaxis, ...]
-    action_label_init = np.zeros(1)
-
     # Render at the save resolution to avoid downscaling artefacts.
     env.set_save_render_mode()
 
-    # ── run MPC ───────────────────────────────────────────────────────────────
-    print(f"Running MPC: {n_mpc} steps, {n_sample} samples, {n_update_iter} update iters\n")
-    subg_output = env.step_subgoal_ptcl(
-        subgoal,
-        GNN,
-        None,                           # init_pos
-        n_mpc=n_mpc,
-        n_look_ahead=n_look_ahead,
-        n_sample=n_sample,
-        n_update_iter=n_update_iter,
-        mpc_type=mpc_type,
-        gd_loop=gd_loop,
-        particle_num=-1,
-        funnel_dist=funnel_dist,
-        action_seq_mpc_init=action_seq_init,
-        action_label_seq_mpc_init=action_label_init,
-        time_lim=time_lim,
-        auto_particle_r=True,
-    )
+    # ── run MPC (model-agnostic via simple_mpc adapter) ───────────────────────
+    print(f"Running MPC with GNN model via run_simple_mpc\n")
+    subg_output = run_simple_mpc(env, GNN, subgoal, config)
 
     env.restore_native_render_mode()
 
@@ -219,6 +195,7 @@ def main():
     raw_obs      = subg_output['raw_obs']         # (n_mpc+1, H, W, 5)
     states       = subg_output['states']          # list[n_mpc+1] of (particle_num, 3)
     states_pred  = subg_output['states_pred']     # list[n_mpc]   of (particle_num, 3)
+    rew_means    = subg_output['rew_means']       # (n_mpc, 1, n_update_iter*gd_loop)
 
     cam_params = env.get_cam_params()
 
@@ -231,6 +208,13 @@ def main():
         pts_cur         = states[i]             # actual particles before step i
         pts_pred        = states_pred[i]        # model prediction of state after step i
         pts_actual_next = states[i + 1]         # actual particles after step i
+
+        # ── diagnostic prints ─────────────────────────────────────────────────
+        rew_i  = rew_means[i, 0, :]
+        valid  = rew_i[rew_i != 0]
+        rew_rng = f"{valid.min():.3f}→{valid.max():.3f}" if len(valid) > 1 else "n/a"
+        print(f"  step {i + 1}  reward: {rew_rng}  "
+              f"(std={float(rew_means[i, 0, :].std()):.4f})")
 
         goal_for_panel = goal_img_rgb if i == 0 else None
 
@@ -255,12 +239,29 @@ def main():
 
     # ── save video ────────────────────────────────────────────────────────────
     if panels:
-        H_v, W_v = panels[0].shape[:2]
+        # Pad all frames to the same size (first panel may be wider due to goal tile)
+        max_w = max(p.shape[1] for p in panels)
+        max_h = max(p.shape[0] for p in panels)
+        padded = []
+        for p in panels:
+            ph, pw = p.shape[:2]
+            if ph < max_h or pw < max_w:
+                canvas = np.zeros((max_h, max_w, 3), dtype=np.uint8)
+                canvas[:ph, :pw] = p
+                padded.append(canvas)
+            else:
+                padded.append(p)
+
         vid_path = os.path.join(run_dir, 'prediction_comparison.avi')
+        fps = max(1, video_fps)
         writer = cv2.VideoWriter(vid_path, cv2.VideoWriter_fourcc(*'MJPG'),
-                                 max(1, video_fps), (W_v, H_v))
-        for f in panels:
-            writer.write(f)
+                                 fps, (max_w, max_h))
+        hold_frames = fps * 2      # 2 seconds per step
+        final_frames = fps * 5     # 5 seconds on last frame
+        for idx, f in enumerate(padded):
+            n_repeat = final_frames if idx == len(padded) - 1 else hold_frames
+            for _ in range(n_repeat):
+                writer.write(f)
         writer.release()
         print(f"\nSaved comparison video → {vid_path}")
 
@@ -269,13 +270,36 @@ def main():
     plt.plot(rewards, marker='o')
     plt.xlabel('MPC step')
     plt.ylabel('Reward')
-    plt.title('Reward over MPC steps')
+    plt.title('Reward over MPC steps (GNN model)')
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plot_path = os.path.join(run_dir, 'rewards.png')
     plt.savefig(plot_path, dpi=150)
     plt.close()
     print(f"Saved reward plot → {plot_path}")
+
+    # ── per-step optimizer convergence plot ───────────────────────────────────
+    n_steps_ran = rew_means.shape[0]
+    n_cols = min(n_steps_ran, 5)
+    n_rows = int(np.ceil(n_steps_ran / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols,
+                              figsize=(4 * n_cols, 3 * n_rows), squeeze=False)
+    for i in range(n_steps_ran):
+        ax = axes[i // n_cols][i % n_cols]
+        curve = rew_means[i, 0, :]
+        ax.plot(curve)
+        ax.set_title(f"Step {i+1}  Δr={curve[-1]-curve[0]:.3f}", fontsize=9)
+        ax.set_xlabel('iter', fontsize=8)
+        ax.set_ylabel('mean reward', fontsize=8)
+        ax.grid(True, alpha=0.3)
+    for i in range(n_steps_ran, n_rows * n_cols):
+        axes[i // n_cols][i % n_cols].set_visible(False)
+    fig.suptitle('Optimizer convergence per MPC step (GNN model)', fontsize=11)
+    fig.tight_layout()
+    conv_path = os.path.join(run_dir, 'optimizer_convergence.png')
+    fig.savefig(conv_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved optimizer convergence plot → {conv_path}")
 
     print(f"\nDone. All outputs in: {run_dir}")
 
